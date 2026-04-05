@@ -135,10 +135,28 @@ async function handleCheckStatus(sid) {
 }
 
 async function handleRefreshTokenPost(request) {
-  const body = await request.json().catch(() => ({}))
-  const refreshTokenValue = body?.refresh_token
+  logRefreshTokenStep('request_received')
+
+  let body = {}
+  let refreshTokenValue = ''
+
+  try {
+    body = await request.json()
+    logRefreshTokenStep('request_body_parsed')
+  } catch (error) {
+    logRefreshTokenStep(
+      'request_body_parse_failed',
+      {
+        error: getErrorMessage(error),
+      },
+      'warn'
+    )
+  }
+
+  refreshTokenValue = body?.refresh_token
 
   if (!refreshTokenValue) {
+    logRefreshTokenStep('missing_refresh_token', {}, 'warn')
     return json(
       {
         code: 400,
@@ -150,8 +168,20 @@ async function handleRefreshTokenPost(request) {
   }
 
   try {
+    logRefreshTokenStep('refresh_started', {
+      refresh_token_masked: maskToken(refreshTokenValue),
+      refresh_token_length: refreshTokenValue.length,
+    })
+
     const tokenInfo = await getTokenInfo({
       refresh_token: refreshTokenValue,
+    })
+
+    logRefreshTokenStep('refresh_succeeded', {
+      refresh_token_masked: maskToken(tokenInfo.refresh_token),
+      access_token_present: Boolean(tokenInfo.access_token),
+      refresh_token_rotated: tokenInfo.refresh_token !== refreshTokenValue,
+      expires_in: tokenInfo.expires_in ?? null,
     })
 
     return json({
@@ -161,6 +191,16 @@ async function handleRefreshTokenPost(request) {
       expires_in: tokenInfo.expires_in,
     })
   } catch (error) {
+    logRefreshTokenStep(
+      'refresh_failed',
+      {
+        refresh_token_masked: maskToken(refreshTokenValue),
+        refresh_token_length: refreshTokenValue.length,
+        error: getErrorMessage(error),
+      },
+      'error'
+    )
+
     return json(
       {
         code: 500,
@@ -203,6 +243,7 @@ async function handleRefreshTokenGet(url) {
 }
 
 async function getTokenInfo(extraPayload) {
+  const isRefreshTokenFlow = Boolean(extraPayload?.refresh_token)
   const t = Math.floor(Date.now() / 1000)
   const sendData = {
     ...getParams(t),
@@ -214,20 +255,51 @@ async function getTokenInfo(extraPayload) {
     Object.entries(sendData).map(([key, value]) => [key, String(value)])
   )
 
+  if (isRefreshTokenFlow) {
+    logRefreshTokenStep('upstream_request_prepared', {
+      refresh_token_masked: maskToken(extraPayload.refresh_token),
+      refresh_token_length: extraPayload.refresh_token.length,
+    })
+  }
+
   const tokenResponse = await fetch(TOKEN_API, {
     method: 'POST',
     headers,
     body: JSON.stringify(sendData),
   })
 
+  if (isRefreshTokenFlow) {
+    logRefreshTokenStep('upstream_response_received', {
+      status: tokenResponse.status,
+      ok: tokenResponse.ok,
+    })
+  }
+
   if (!tokenResponse.ok) {
     throw new Error('获取 token 失败')
   }
 
   const tokenData = await tokenResponse.json()
-  const plainData = decrypt(tokenData?.data?.ciphertext, tokenData?.data?.iv, t)
 
-  return JSON.parse(plainData)
+  if (isRefreshTokenFlow) {
+    logRefreshTokenStep('upstream_payload_parsed', {
+      has_ciphertext: Boolean(tokenData?.data?.ciphertext),
+      has_iv: Boolean(tokenData?.data?.iv),
+    })
+  }
+
+  const plainData = decrypt(tokenData?.data?.ciphertext, tokenData?.data?.iv, t)
+  const parsedTokenData = JSON.parse(plainData)
+
+  if (isRefreshTokenFlow) {
+    logRefreshTokenStep('token_payload_ready', {
+      access_token_present: Boolean(parsedTokenData?.access_token),
+      refresh_token_masked: maskToken(parsedTokenData?.refresh_token),
+      expires_in: parsedTokenData?.expires_in ?? null,
+    })
+  }
+
+  return parsedTokenData
 }
 
 function decrypt(ciphertext, iv, t) {
@@ -903,6 +975,38 @@ function json(data, status = 200) {
       'content-type': 'application/json; charset=UTF-8',
     },
   })
+}
+
+function logRefreshTokenStep(step, details = {}, level = 'log') {
+  const payload = JSON.stringify({
+    scope: 'refresh-token',
+    step,
+    ...details,
+  })
+
+  if (level === 'error') {
+    console.error(payload)
+    return
+  }
+
+  if (level === 'warn') {
+    console.warn(payload)
+    return
+  }
+
+  console.log(payload)
+}
+
+function maskToken(token) {
+  if (!token) {
+    return ''
+  }
+
+  if (token.length <= 8) {
+    return `${token.slice(0, 2)}***${token.slice(-2)}`
+  }
+
+  return `${token.slice(0, 6)}***${token.slice(-4)}`
 }
 
 function getErrorMessage(error) {
